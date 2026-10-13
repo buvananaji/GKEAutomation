@@ -1,0 +1,146 @@
+name: Terraform (testcluster)
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "Infraautomation/terraform/**"
+      - ".github/workflows/terraform.yml"
+  push:
+    branches: [main]
+    paths:
+      - "Infraautomation/terraform/**"
+      - ".github/workflows/terraform.yml"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "plan only, or plan + apply (apply still needs approval)"
+        type: choice
+        options: [plan, apply]
+        default: plan
+
+concurrency:
+  group: terraform-testcluster   # never run two Terraform jobs on the same state at once
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.8.5"
+  TF_DIR: Infraautomation/terraform
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+permissions:
+  contents: read
+  id-token: write        # Workload Identity Federation
+  pull-requests: write   # plan comment on PRs
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.TF_DIR }}
+    outputs:
+      has_changes: ${{ steps.plan.outputs.exitcode == '2' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_TERRAFORM_SA }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: terraform init
+        run: terraform init
+
+      - name: terraform validate
+        run: terraform validate
+
+      - name: terraform plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -detailed-exitcode -out=tfplan
+          code=$?
+          echo "exitcode=$code" >> "$GITHUB_OUTPUT"
+          [ $code -eq 1 ] && exit 1
+          terraform show -no-color tfplan > plan.txt
+          exit 0
+
+      - name: Plan summary
+        run: |
+          {
+            echo "### Terraform plan (testcluster)"
+            echo '```'
+            grep -E '^\s*# |^Plan:|^No changes' plan.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let plan = fs.readFileSync('${{ env.TF_DIR }}/plan.txt', 'utf8');
+            if (plan.length > 60000) plan = plan.slice(0, 60000) + '\n... (truncated, see job log)';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `### Terraform plan (testcluster)\n<details><summary>Show plan</summary>\n\n\`\`\`hcl\n${plan}\n\`\`\`\n</details>`,
+            });
+
+      - name: Upload plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.TF_DIR }}/tfplan
+          retention-days: 5
+
+  apply:
+    needs: plan
+    if: >-
+      needs.plan.outputs.has_changes == 'true' &&
+      ((github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+       (github.event_name == 'workflow_dispatch' && inputs.action == 'apply'))
+    runs-on: ubuntu-latest
+    environment: production   # pauses here until a reviewer approves
+    defaults:
+      run:
+        working-directory: ${{ env.TF_DIR }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_TERRAFORM_SA }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Download plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.TF_DIR }}
+
+      - name: terraform init
+        run: terraform init
+
+      - name: terraform apply (exactly the reviewed plan)
+        run: terraform apply tfplan
+
+      - name: Outputs
+        run: terraform output

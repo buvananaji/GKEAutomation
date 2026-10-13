@@ -24,7 +24,25 @@ Creates in project `test1-project-234813`:
 Differences: the node pool is a separate Terraform resource (best practice), and
 `deletion_protection` is on.
 
-## Usage
+## Pipeline (GitHub Actions)
+
+`.github/workflows/terraform.yml` runs whenever files in `Infraautomation/terraform/` change:
+
+| Trigger | What happens |
+|---|---|
+| Pull request to `main` | fmt check → init → validate → **plan**, posted as a PR comment |
+| Push / merge to `main` | plan → **waits for approval** (environment `production`) → `apply` of exactly that plan |
+| Actions → *Run workflow* | `plan`, or `apply` (still needs approval) |
+
+- Auth: Workload Identity Federation (no keys) as `terraform-ci@test1-project-234813.iam.gserviceaccount.com`,
+  usable only by this repository. Secrets: `GCP_WIF_PROVIDER`, `GCP_TERRAFORM_SA`.
+- State: `gs://test1-project-234813-tfstate/gke/testcluster` (versioned). Only one run at a time.
+- One-time Google Cloud setup: `Infraautomation/setup/bootstrap-ci.ps1` (run as project Owner).
+
+Typical change: branch → edit `.tf` → open PR → read the plan comment → merge → approve the
+`production` deployment in the Actions run.
+
+## Local usage
 
 ```bash
 cd Infraautomation/terraform
