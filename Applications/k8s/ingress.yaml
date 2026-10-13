@@ -1,0 +1,34 @@
+# One Google HTTP(S) load balancer / one public IP for all apps.
+# GKE does not strip the path prefix, so /node/... reaches hello-node as /node/...
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: apps
+  namespace: apps
+  annotations:
+    kubernetes.io/ingress.class: gce
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /node
+            pathType: Prefix
+            backend:
+              service:
+                name: hello-node
+                port:
+                  number: 80
+          - path: /python
+            pathType: Prefix
+            backend:
+              service:
+                name: hello-python
+                port:
+                  number: 80
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nginx-sample
+                port:
+                  number: 80

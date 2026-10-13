@@ -1,0 +1,115 @@
+name: Deploy applications (testcluster)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Applications/**"
+      - ".github/workflows/applications.yml"
+  workflow_dispatch:   # manual run deploys every app
+
+env:
+  PROJECT_ID: test1-project-234813
+  REGION: us-central1
+  CLUSTER: testcluster
+  REGISTRY: us-central1-docker.pkg.dev/test1-project-234813/docker-repotest
+  APP_ROOT: Applications
+
+permissions:
+  contents: read
+  id-token: write   # Workload Identity Federation
+
+jobs:
+  # Work out which apps changed (and whether shared Applications/k8s changed).
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      apps: ${{ steps.pick.outputs.apps }}
+      shared: ${{ steps.pick.outputs.shared }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            nginx-sample: Applications/apps/nginx-sample/**
+            hello-node: Applications/apps/hello-node/**
+            hello-python: Applications/apps/hello-python/**
+
+      - id: shared
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            shared:
+              - Applications/k8s/**
+              - .github/workflows/applications.yml
+
+      - id: pick
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo 'apps=["nginx-sample","hello-node","hello-python"]' >> "$GITHUB_OUTPUT"
+            echo 'shared=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'apps=${{ steps.filter.outputs.changes }}' >> "$GITHUB_OUTPUT"
+            echo 'shared=${{ steps.shared.outputs.shared }}' >> "$GITHUB_OUTPUT"
+          fi
+
+  # Namespace + Ingress (one public IP for all apps).
+  shared:
+    needs: changes
+    if: needs.changes.outputs.shared == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOYER_SA }}
+      - uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.CLUSTER }}
+          location: ${{ env.REGION }}
+      # Namespace first: "kubectl apply -f dir/" goes alphabetically (ingress before namespace).
+      - run: |
+          kubectl apply -f ${APP_ROOT}/k8s/namespace.yaml
+          kubectl apply -f ${APP_ROOT}/k8s/ingress.yaml
+
+  # Build, push and deploy each changed app in parallel.
+  deploy:
+    needs: changes
+    if: needs.changes.outputs.apps != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app: ${{ fromJSON(needs.changes.outputs.apps) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOYER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build and push image
+        run: |
+          gcloud auth configure-docker ${REGION}-docker.pkg.dev --quiet
+          IMAGE=${REGISTRY}/${{ matrix.app }}:${GITHUB_SHA}
+          docker build -t "$IMAGE" ${APP_ROOT}/apps/${{ matrix.app }}
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.CLUSTER }}
+          location: ${{ env.REGION }}
+
+      - name: Deploy
+        run: |
+          kubectl apply -f ${APP_ROOT}/k8s/namespace.yaml
+          sed -i -e "s|IMAGE_PLACEHOLDER|${IMAGE}|" -e "s|VERSION_PLACEHOLDER|\"${GITHUB_SHA::7}\"|" ${APP_ROOT}/apps/${{ matrix.app }}/k8s/deployment.yaml
+          kubectl apply -f ${APP_ROOT}/apps/${{ matrix.app }}/k8s/
+          kubectl -n apps rollout status deployment/${{ matrix.app }} --timeout=180s

@@ -4,7 +4,8 @@
 # Creates:
 #   - gs://test1-project-234813-tfstate   Terraform state (versioned, private)
 #   - terraform-ci service account        identity the pipeline runs as
-#   - WIF provider "gkeautomation"        lets ONLY this repo's workflows act as terraform-ci (no keys)
+#   - gke-deployer service account        identity the Applications pipeline runs as
+#   - WIF provider "gkeautomation"        lets ONLY this repo's workflows act as these accounts (no keys)
 
 $ErrorActionPreference = "Stop"
 $gcloud  = "C:\Program Files (x86)\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd"
@@ -45,7 +46,17 @@ Invoke-Gcloud iam workload-identity-pools providers create-oidc gkeautomation --
 Invoke-Gcloud iam service-accounts add-iam-policy-binding $SA --project $P --role roles/iam.workloadIdentityUser `
   --member "principalSet://iam.googleapis.com/projects/$PN/locations/global/workloadIdentityPools/github/attribute.repository/$Repo" --format=none
 
+Write-Host "== Applications deployer (push images + deploy to GKE only)"
+$DeploySA = "gke-deployer@$P.iam.gserviceaccount.com"
+Invoke-Gcloud iam service-accounts create gke-deployer --project $P --display-name "GKE app deployer (GKEAutomation)"
+foreach ($role in "roles/artifactregistry.writer", "roles/container.developer") {
+  Invoke-Gcloud projects add-iam-policy-binding $P --member "serviceAccount:$DeploySA" --role $role --condition=None --format=none
+}
+Invoke-Gcloud iam service-accounts add-iam-policy-binding $DeploySA --project $P --role roles/iam.workloadIdentityUser `
+  --member "principalSet://iam.googleapis.com/projects/$PN/locations/global/workloadIdentityPools/github/attribute.repository/$Repo" --format=none
+
 Write-Host ""
 Write-Host "Done. GitHub secrets for ${Repo}:"
 Write-Host "  GCP_WIF_PROVIDER = projects/$PN/locations/global/workloadIdentityPools/github/providers/gkeautomation"
 Write-Host "  GCP_TERRAFORM_SA = $SA"
+Write-Host "  GCP_DEPLOYER_SA  = $DeploySA"
