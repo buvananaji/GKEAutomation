@@ -8,12 +8,12 @@ terraform {
     }
   }
 
-  # Remote state (recommended once more than one person or CI runs Terraform).
-  # Create the bucket first, then uncomment and run `terraform init -migrate-state`.
-  # backend "gcs" {
-  #   bucket = "test1-project-234813-tfstate"
-  #   prefix = "gke/testcluster"
-  # }
+  # Remote state shared by the GitHub Actions pipeline and local runs.
+  # The bucket is created by Infraautomation/setup/bootstrap-ci.ps1.
+  backend "gcs" {
+    bucket = "test1-project-234813-tfstate"
+    prefix = "gke/testcluster"
+  }
 }
 
 provider "google" {
