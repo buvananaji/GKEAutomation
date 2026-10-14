@@ -7,6 +7,8 @@ metadata:
   namespace: apps
   annotations:
     kubernetes.io/ingress.class: gce
+    # Static IP reserved by Infraautomation/terraform/network.tf (8.232.126.112)
+    kubernetes.io/ingress.global-static-ip-name: testcluster-apps-ip
 spec:
   rules:
     - http:
