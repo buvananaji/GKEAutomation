@@ -1,0 +1,272 @@
+name: Test environment (testcluster)
+
+# Full lifecycle for a throw-away test environment:
+#   create  -> Terraform plan -> [approval] -> apply -> deploy all apps -> smoke test
+#   destroy -> [type "testcluster" + approval] -> delete apps & load balancer -> Terraform destroy
+# Manual only: nothing here runs on push or pull request.
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "create = build infra + deploy apps; destroy = delete apps + infra"
+        type: choice
+        options: [create, destroy]
+        required: true
+      confirm:
+        description: "For destroy only: type testcluster to confirm"
+        type: string
+        required: false
+        default: ""
+
+concurrency:
+  group: terraform-testcluster   # shared with terraform.yml: one run on this state at a time
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: test1-project-234813
+  REGION: us-central1
+  CLUSTER: testcluster
+  REGISTRY: us-central1-docker.pkg.dev/test1-project-234813/docker-repotest
+  APPS: nginx-sample hello-node hello-python
+  TF_VERSION: "1.8.5"
+  TF_DIR: Infraautomation/terraform
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+permissions:
+  contents: read
+  id-token: write   # Workload Identity Federation
+
+jobs:
+  # ------------------------------------------------------------------ create
+  infra-plan:
+    if: inputs.action == 'create'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.TF_DIR }}
+    outputs:
+      has_changes: ${{ steps.plan.outputs.exitcode == '2' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_TERRAFORM_SA }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - run: terraform init
+      - name: terraform plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -detailed-exitcode -out=tfplan
+          code=$?
+          echo "exitcode=$code" >> "$GITHUB_OUTPUT"
+          [ $code -eq 1 ] && exit 1
+          terraform show -no-color tfplan > plan.txt
+          exit 0
+      - name: Plan summary
+        run: |
+          {
+            echo "### Create: Terraform plan"
+            echo '```'
+            grep -E '^\s*# |^Plan:|^No changes' plan.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-create
+          path: ${{ env.TF_DIR }}/tfplan
+          retention-days: 1
+
+  infra-apply:
+    needs: infra-plan
+    if: needs.infra-plan.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    environment: production   # pauses for approval before anything is created
+    defaults:
+      run:
+        working-directory: ${{ env.TF_DIR }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_TERRAFORM_SA }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan-create
+          path: ${{ env.TF_DIR }}
+      - run: terraform init
+      - run: terraform apply tfplan
+
+  deploy-apps:
+    needs: [infra-plan, infra-apply]
+    # Run after a successful apply, or straight away when the infra already existed (apply skipped).
+    if: >-
+      always() && inputs.action == 'create' &&
+      needs.infra-plan.result == 'success' &&
+      (needs.infra-apply.result == 'success' || needs.infra-apply.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOYER_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.CLUSTER }}
+          location: ${{ env.REGION }}
+      - name: Build, push and deploy all apps
+        run: |
+          gcloud auth configure-docker ${REGION}-docker.pkg.dev --quiet
+          kubectl apply -f Applications/k8s/namespace.yaml
+          for app in $APPS; do
+            image=${REGISTRY}/${app}:${GITHUB_SHA}
+            echo "::group::$app"
+            docker build -t "$image" Applications/apps/$app
+            docker push "$image"
+            sed -i -e "s|IMAGE_PLACEHOLDER|${image}|" -e "s|VERSION_PLACEHOLDER|\"${GITHUB_SHA::7}\"|" Applications/apps/$app/k8s/deployment.yaml
+            kubectl apply -f Applications/apps/$app/k8s/
+            echo "::endgroup::"
+          done
+          for app in $APPS; do
+            kubectl -n apps rollout status deployment/$app --timeout=300s
+          done
+          kubectl apply -f Applications/k8s/ingress.yaml
+
+  smoke-test:
+    needs: deploy-apps
+    if: always() && needs.deploy-apps.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOYER_SA }}
+      - uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.CLUSTER }}
+          location: ${{ env.REGION }}
+      - name: Wait for the load balancer and test every app
+        run: |
+          ip=""
+          for i in $(seq 1 90); do   # up to 15 min for a new Google load balancer
+            ip=$(kubectl -n apps get ingress apps -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            [ -n "$ip" ] && break
+            sleep 10
+          done
+          [ -z "$ip" ] && { echo "::error::Ingress got no IP"; kubectl -n apps describe ingress apps; exit 1; }
+          echo "Ingress IP: $ip"
+          ok=0
+          for i in $(seq 1 90); do   # need 3 clean passes in a row
+            if curl -sf -m 5 "http://$ip/" | grep -q nginx-sample \
+              && curl -sf -m 5 "http://$ip/node" | grep -q hello-node \
+              && curl -sf -m 5 "http://$ip/python" | grep -q hello-python; then
+              ok=$((ok+1)); [ $ok -ge 3 ] && break
+            else
+              ok=0
+            fi
+            sleep 10
+          done
+          [ $ok -ge 3 ] || { echo "::error::Apps not serving on http://$ip"; kubectl -n apps describe ingress apps; exit 1; }
+          {
+            echo "### Test environment is up"
+            echo "| App | URL |"
+            echo "|---|---|"
+            echo "| nginx-sample | http://$ip/ |"
+            echo "| hello-node | http://$ip/node |"
+            echo "| hello-python | http://$ip/python |"
+            echo
+            echo "When testing is done: **Run workflow → action: destroy, confirm: testcluster**."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------------ destroy
+  destroy-guard:
+    if: inputs.action == 'destroy'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check confirmation
+        run: |
+          if [ "${{ inputs.confirm }}" != "testcluster" ]; then
+            echo "::error::To destroy, set confirm to exactly: testcluster"
+            exit 1
+          fi
+
+  destroy-apps:
+    needs: destroy-guard
+    runs-on: ubuntu-latest
+    environment: production   # pauses for approval before anything is deleted
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_TERRAFORM_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          install_components: gke-gcloud-auth-plugin
+      - name: Delete apps and their load balancer
+        run: |
+          if ! gcloud container clusters describe "$CLUSTER" --region "$REGION" --project "$PROJECT_ID" >/dev/null 2>&1; then
+            echo "Cluster $CLUSTER not found - nothing to delete."
+            exit 0
+          fi
+          gcloud container clusters get-credentials "$CLUSTER" --region "$REGION" --project "$PROJECT_ID"
+          # Ingress first: its finalizer waits until Google has removed the load balancer.
+          kubectl -n apps delete ingress --all --ignore-not-found --wait=true --timeout=10m
+          # The namespace only disappears once everything in it is gone, including the
+          # ServiceNetworkEndpointGroup objects, whose finalizers wait for Google to delete
+          # the matching network endpoint groups. So nothing is left orphaned (and billing).
+          kubectl delete namespace apps --ignore-not-found --wait=true --timeout=10m
+          echo "Apps and load balancer deleted."
+
+  destroy-infra:
+    needs: destroy-apps
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.TF_DIR }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_TERRAFORM_SA }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - run: terraform init
+      - name: Lift cluster deletion protection (state-only change)
+        run: |
+          if terraform state list | grep -qx 'google_container_cluster.this'; then
+            terraform apply -auto-approve -var deletion_protection=false -target=google_container_cluster.this
+          fi
+      # Targets: cluster, node pool and registry. Left in place on purpose:
+      #  - google_project_service.*        (APIs; other things use them)
+      #  - google_compute_global_address.* (static Ingress IP, if reserved: keeps the same URL next time)
+      - name: terraform destroy
+        run: |
+          terraform destroy -auto-approve -var deletion_protection=false \
+            -target=google_container_node_pool.default \
+            -target=google_container_cluster.this \
+            -target=google_artifact_registry_repository.docker
+      - name: Summary
+        run: |
+          {
+            echo "### Test environment destroyed"
+            echo "Deleted: apps, Ingress/load balancer, node pool, cluster \`$CLUSTER\`, registry \`docker-repotest\` (and its images)."
+            echo "Kept: enabled APIs, Terraform state, and the static Ingress IP if one is reserved."
+            echo
+            echo "Recreate any time: **Run workflow → action: create**."
+          } >> "$GITHUB_STEP_SUMMARY"
