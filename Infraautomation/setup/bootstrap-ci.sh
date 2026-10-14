@@ -20,7 +20,7 @@ DEPLOY_SA=gke-deployer@$P.iam.gserviceaccount.com
 PRINCIPAL="principalSet://iam.googleapis.com/projects/$PN/locations/global/workloadIdentityPools/github/attribute.repository/$REPO"
 
 gcloud config set project "$P" >/dev/null
-gcloud services enable iamcredentials.googleapis.com sts.googleapis.com container.googleapis.com artifactregistry.googleapis.com
+gcloud services enable iamcredentials.googleapis.com sts.googleapis.com container.googleapis.com artifactregistry.googleapis.com cloudresourcemanager.googleapis.com
 
 echo "== State bucket"
 gcloud storage buckets describe "$BUCKET" >/dev/null 2>&1 || \
