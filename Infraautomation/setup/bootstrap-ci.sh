@@ -34,7 +34,7 @@ gcloud iam service-accounts describe "$DEPLOY_SA" >/dev/null 2>&1 || \
   gcloud iam service-accounts create gke-deployer --display-name "GKE app deployer (GKEAutomation)"
 
 echo "== terraform-ci roles"
-for role in roles/container.admin roles/artifactregistry.admin roles/serviceusage.serviceUsageAdmin roles/compute.networkViewer; do
+for role in roles/container.admin roles/artifactregistry.admin roles/serviceusage.serviceUsageAdmin roles/compute.networkViewer roles/compute.publicIpAdmin; do
   gcloud projects add-iam-policy-binding "$P" --member "serviceAccount:$TF_SA" --role "$role" --condition=None --format=none
 done
 gcloud storage buckets add-iam-policy-binding "$BUCKET" --member "serviceAccount:$TF_SA" --role roles/storage.objectAdmin --format=none

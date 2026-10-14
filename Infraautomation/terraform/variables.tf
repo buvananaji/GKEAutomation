@@ -69,6 +69,12 @@ variable "deletion_protection" {
   default     = true
 }
 
+variable "apps_ingress_ip" {
+  description = "IPv4 address to reserve for the apps Ingress. Set to the Ingress's current IP to keep it; null allocates a new one."
+  type        = string
+  default     = null
+}
+
 variable "registry_name" {
   description = "Artifact Registry (Docker) repository name."
   type        = string
